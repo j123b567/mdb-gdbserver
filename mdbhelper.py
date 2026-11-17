@@ -46,6 +46,62 @@ def _reg(name):
     return r
 
 
+def _cmd_tool_name(name):
+    """MDB's "hwtool" type for a tool name ("ICD 3" -> "icd3"), as ToolFinder
+    in lib/mdb.jar derives it."""
+    n = name.lower().replace(" ", "").replace("-", "")
+    return {"simulator": "sim", "starterkits(pkob)": "sk",
+            "curiosity/starterkits(pkob4)": "pkob4"}.get(n, n)
+
+
+def tools():
+    """Print the connected tools as "tool TYPE INDEX SERIAL DESCRIPTION".
+
+    "hwtool TYPE INDEX" selects the tool. MDB's ToolFinder lists the USB
+    tools of the vendor IDs 04D8 and 03EB, and INDEX counts only the tools
+    whose ID contains the product ID of TYPE, in the order of that list.
+    This repeats it, so the index is the one MDB uses.
+    """
+    try:
+        from org.openide.util import Lookup
+        from com.microchip.mplab.comm import MPLABCommProviderInterface
+        from com.microchip.mplab.mdbcore.platformtool import PlatformToolMetaManager
+        comm = Lookup.getDefault().lookup(MPLABCommProviderInterface)
+        found = comm.GetCurrentToolList(None, "USB", "04D8", None)
+        other = comm.GetCurrentToolList(None, "USB", "03EB", None)
+        if other is not None and not other.isEmpty():
+            found.putAll(other)
+        pids = {}  # product ID without "0x" -> hwtool type
+        for meta in PlatformToolMetaManager.getAllTools():
+            pid = meta.getUSBProductID()
+            if pid and pid.startswith("0x"):
+                pids[pid[2:]] = _cmd_tool_name(meta.getName())
+        ids = [found.get(k) for k in found.keySet()]
+        for tid in ids:
+            fields = tid.split(":=")
+            serial = fields[7] if len(fields) > 7 else "?"
+            descr = fields[6] if len(fields) > 6 else ""
+            kind, index = "?", 0
+            for pid, name in pids.items():
+                if pid.upper() == fields[3].upper():
+                    kind = name
+                    index = [t for t in ids if pid in t].index(tid)
+            _out("tool %s %d %s %s" % (kind, index, serial, descr))
+    except Exception, e:
+        _out("error %s" % e)
+    _out("end")
+
+
+def tool():
+    """Print the tool MDB is connected to: "tool CLASS ID"."""
+    try:
+        a = _assembly()
+        _out("tool %s %s" % (a.GetToolClass(), a.GetToolID()))
+    except Exception, e:
+        _out("error %s" % e)
+    _out("end")
+
+
 def regs():
     """Print the 38 GDB registers as hex words, in GDB order, then CP0 Debug."""
     try:

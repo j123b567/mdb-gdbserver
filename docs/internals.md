@@ -23,7 +23,7 @@ runs inside the MDB JVM and can import every MDB class.
 | `M`, `X` | `write /r`, `write /m` (read-modify-write of whole words); flash is refused |
 | `qXfer:memory-map:read` | fixed map: RAM, program flash, boot flash, SFRs |
 | `vFlashErase`, `vFlashWrite` | accepted, data ignored |
-| `vFlashDone` | `hwtool ICD3` + `program <elf>` |
+| `vFlashDone` | `hwtool <tool>` + `program <elf>` |
 | `Z0`, `Z1` / `z0`, `z1` | `break *addr` / `delete n`, both as hardware breakpoints |
 | `Z2`, `Z3`, `Z4` | `watch addr W`, `R`, `RW` |
 | `c`, `vCont;c` | `run` the first time, then `continue` |
@@ -32,6 +32,26 @@ runs inside the MDB JVM and can import every MDB class.
 | `qRcmd` (`monitor ...`) | `program [elf]`, `reset`, otherwise the text goes to MDB as a command; empty `O` packets every second keep gdb from timing out |
 | `P` of the pc right after `load` | accepted and ignored (the target starts from its reset vector) |
 | `D`, `k` | end of this gdb connection; MDB keeps running |
+
+## Selecting the debug tool
+
+MDB selects a tool with `hwtool TYPE [INDEX]`. `ToolFinder` in
+`lib/mdb.jar` lists the USB tools of the vendor IDs 04D8 and 03EB; their
+IDs look like `:=MPLABCommUSB:=04D8:=9009:=0100:=<maker>:=<product>:=<serial>:=...`.
+TYPE is the tool name of `PlatformToolMetaManager` in lower case without
+spaces and dashes (`ICD 3` -> `icd3`), which gives a USB product ID
+(`0x9009`). INDEX counts only the listed tools whose ID contains that
+product ID, so it is not the index printed by `hwtool` without arguments.
+
+MDB has no option for a serial number. The helper function `tools()`
+repeats the lookup of `ToolFinder` and prints type, index and serial
+number of every tool, and the server picks one. `Execute` works only after
+some `hwtool`, so the server sets `hwtool sim` first (about 3 s) and
+switches to the real tool after it; that switch prints
+`E0108-SIM: Failed simulator operation: java.lang.NullPointerException`,
+which does no harm. With `--tool TYPE` alone the simulator step is
+skipped. After the switch, `tool()` (`Assembly.GetToolClass()`,
+`GetToolID()`) confirms the connected tool.
 
 ## Which watchpoint fired
 
@@ -72,7 +92,8 @@ silently, and the session looks hung.
   tried.
 - **A second `program` in one MDB debug session fails** (`Failed to
   program device`, then `The target device is not ready for debugging`).
-  `hwtool ICD3` (7 s) before it fixes it; the server always does that.
+  `hwtool <tool>` (7 s with the ICD 3) before it fixes it; the server
+  always does that.
   MDB `reset` itself is fine.
 - **MIPS addresses in gdb are sign-extended** (`0x9d000000` is
   `0xffffffff9d000000`); the memory map must use that form, otherwise gdb
@@ -91,6 +112,6 @@ silently, and the session looks hung.
 ## Device-specific parts
 
 Fixed in the code: the memory map for `x /r|/p|/m` and for gdb (RAM,
-program flash, boot flash, SFRs, sizes of the PIC32MZ2048), the limits of 8
-breakpoints and 4 watchpoints, and `ICD3` in `hwtool`. MIPS registers,
+program flash, boot flash, SFRs, sizes of the PIC32MZ2048) and the limits
+of 8 breakpoints and 4 watchpoints. MIPS registers,
 CP0 `Debug` and the KSEG layout are the same on PIC32MX and PIC32MZ.

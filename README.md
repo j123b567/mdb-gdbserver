@@ -1,9 +1,9 @@
 # mdb_gdbserver
 
 A GDB remote serial protocol (RSP) server for PIC32 targets on the MPLAB
-ICD 3. It runs the unchanged MDB (the command-line debugger of MPLAB X) as a
-child process and translates gdb requests into MDB commands, so gdb or any
-IDE that talks to a gdb remote target can debug the chip. Nothing in MPLAB X
+debug tools. It runs the unchanged MDB (the command-line debugger of MPLAB
+X) as a child process and translates gdb requests into MDB commands, so gdb
+or any IDE that talks to a gdb remote target can debug the chip. Nothing in MPLAB X
 is patched.
 
 ## Requirements
@@ -11,7 +11,9 @@ is patched.
 - MPLAB X v5.45 on Linux. Other versions are not tested. The server runs
   `/opt/microchip/mplabx/v5.45/mplab_platform/bin/mdb.sh`; set another path
   with `--mdb` or the environment variable `MDB_SH`.
-- MPLAB ICD 3.
+- An MPLAB debug tool. Tested with the ICD 3; the others MDB knows
+  (`icd4`, `pickit3`, `pickit4`, `snap`, `realice`, ...) are selected the
+  same way, but are not tested.
 - PIC32MZ2048ECM100. The memory map and the breakpoint limits of this chip
   are built in; other PIC32MZ EC devices may work with `--device`, but are
   not tested.
@@ -44,15 +46,24 @@ Options:
 |---|---|
 | `--port` | TCP port, default 3333 (only on 127.0.0.1) |
 | `--device` | default `PIC32MZ2048ECM100` |
+| `--tool` | debug tool as `TYPE[:SERIAL]`, e.g. `icd3` or `icd3:JIT123456789`, or `:SERIAL` alone; default: the only tool connected |
 | `--mdb` | path of `mdb.sh`, default `$MDB_SH` or the MPLAB X v5.45 location |
 | `--watch-elf` | program the ELF again when the file changes and no gdb is connected |
 | `--once` | quit after the first gdb connection |
 | `--log`, `--mdb-log` | logs of the RSP packets and of the MDB dialogue, default `mdb_gdbserver.log`, `mdb_gdbserver.mdb.log` |
 
+## Selecting the debug tool
+
+Without `--tool` the server uses the only debug tool connected; with
+none or several it stops and lists them as `TYPE:SERIAL`. `--tool TYPE`
+takes the first tool of that type (the type names are those of MDB's
+`hwtool supported`), `--tool TYPE:SERIAL` or `--tool :SERIAL` one tool by
+its serial number.
+
 ## Building a debuggable ELF
 
-The ELF must be built with the flags MPLAB X uses for a "Debug" build with
-the ICD 3 (XC32):
+The ELF must be built with the flags MPLAB X uses for a "Debug" build
+(XC32). For the ICD 3:
 
 ```
 compile: -g -D__DEBUG -D__MPLAB_DEBUGGER_ICD3=1
@@ -116,7 +127,7 @@ programming waits until programming is done, so set
   starts the program from the reset vector; before it gdb sees only the
   reset PC 0xBFC00000.
 - A halt (breakpoint, Ctrl-C) takes about 0.8 s.
-- The device and the ICD 3 are fixed in the code (see
+- The device is fixed in the code (see
   [docs/internals.md](docs/internals.md)).
 
 ## License

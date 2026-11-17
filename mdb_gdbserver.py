@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """GDB remote serial protocol (RSP) server on top of the stock MPLAB X MDB.
 
-Usage: mdb_gdbserver.py [--port 3333] [--device PIC32MZ2048ECM100] [--mdb MDB_SH] ELF
+Usage: mdb_gdbserver.py [--port 3333] [--device PIC32MZ2048ECM100]
+                        [--tool TYPE[:SERIAL]] [--mdb MDB_SH] ELF
 
-Starts mdb.sh as a child process, connects the ICD 3 in debug mode,
+Starts mdb.sh as a child process, connects the debug tool (by default the
+only one connected) in debug mode,
 programs ELF and then serves GDB connections on localhost:PORT, one after
 the other. MDB keeps running between connections, so only the first
 connection pays its start (about 30 s).
@@ -18,7 +20,7 @@ Supported:
     write (M, X) of RAM and SFRs; a memory map tells GDB where flash is
   - GDB "load": vFlashErase/vFlashWrite are accepted, vFlashDone programs
     ELF (the file given on the command line, read again from disk) with
-    "hwtool ICD3" + "program"; the data sent by GDB is not used
+    "hwtool" + "program"; the data sent by GDB is not used
   - registers: read of r0..r31, sr, lo, hi, bad, cause, pc through the
     Jython helper mdbhelper.py (MDB "LoadScript"/"Execute"); no write,
     except that a write of the PC right after "load" is accepted and ignored
@@ -124,10 +126,11 @@ class Target:
     WATCH_TYPES = {2: "W", 3: "R", 4: "RW"}  # GDB Z2/Z3/Z4 -> MDB "watch"
     WATCH_NAMES = {2: "watch", 3: "rwatch", 4: "awatch"}
 
-    def __init__(self, mdb, log, elf):
+    def __init__(self, mdb, log, elf, hwtool):
         self.mdb = mdb
         self.log = log
         self.elf = elf
+        self.hwtool = hwtool  # argument of MDB "hwtool", e.g. "icd3 0"
         self.reset_state()
 
     def reset_state(self):
@@ -278,12 +281,12 @@ class Target:
         """Program ELF (default: the current one) into the target.
 
         A second "program" in the same MDB debug session fails ("Failed to
-        program device"), a new "hwtool ICD3" before it makes it work.
+        program device"), a new "hwtool" before it makes it work.
         """
         if elf:
             self.elf = os.path.abspath(elf)
         self.remove_all()
-        out = self.mdb.command("hwtool ICD3", timeout=120)
+        out = self.mdb.command(f"hwtool {self.hwtool}", timeout=120)
         out += self.mdb.command(f"program {self.elf}", timeout=600)
         self.reset_state()
         if not any("Program succeeded" in line for line in out):
@@ -600,10 +603,53 @@ def watch_elf(target, busy, log):
             busy.release()
 
 
+def connect_tool(mdb, spec, helper):
+    """Connect the debug tool given by spec ("", "TYPE", "TYPE:SERIAL" or
+    ":SERIAL") and load the helper. Returns the argument for "hwtool".
+
+    Without a serial number, "hwtool TYPE" takes the first tool of that
+    type. Otherwise the helper lists the connected tools; it can run only
+    after some "hwtool", so the simulator is set first (about 3 s). The
+    tool must then be unique.
+    """
+    def hwtool_command(arg):
+        out = mdb.command(f"hwtool {arg}", timeout=120)
+        if any("did not find" in line for line in out):
+            raise MdbError(f"hwtool {arg}: " + " ".join(l.strip() for l in out if l.strip()))
+
+    kind, _, serial = spec.partition(":")
+    kind = kind.lower()
+    if kind and not serial:
+        hwtool = kind
+        hwtool_command(hwtool)
+        mdb.command(f"LoadScript {helper}", timeout=120)
+    else:
+        hwtool_command("sim")
+        mdb.command(f"LoadScript {helper}", timeout=120)
+        found = [line.split(None, 4)[1:] for line in mdb.script("tools()")
+                 if line.startswith("tool ")]
+        listing = "\n".join(f"  {k}:{s}  {d}" for k, _, s, d in found) or "  none"
+        matches = [(k, i, s) for k, i, s, _ in found
+                   if k != "?" and (not kind or k == kind) and (not serial or s == serial)]
+        if len(matches) != 1:
+            what = "no" if not matches else "more than one"
+            raise MdbError(f"{what} debug tool matches --tool {spec!r}; connected:\n{listing}")
+        kind, index, serial = matches[0]
+        hwtool = f"{kind} {index}"
+        hwtool_command(hwtool)
+    line = next((l for l in mdb.script("tool()") if l.startswith("tool ")), "")
+    if "Simulator" in line and kind != "sim" or serial and serial not in line:
+        raise MdbError(f"hwtool {hwtool} did not connect the tool ({line or 'no tool'})")
+    return hwtool
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=3333)
     ap.add_argument("--device", default="PIC32MZ2048ECM100")
+    ap.add_argument("--tool", default="",
+                    help="debug tool as TYPE[:SERIAL], e.g. icd3 or icd3:JIT123456789; "
+                         "default: the only one connected")
     ap.add_argument("--mdb", default=MDB_SH, help="path of mdb.sh of MPLAB X")
     ap.add_argument("--log", default="mdb_gdbserver.log")
     ap.add_argument("--mdb-log", default="mdb_gdbserver.mdb.log")
@@ -625,9 +671,14 @@ def main():
     t0 = time.monotonic()
     mdb.command("echo start", timeout=300)
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mdbhelper.py")
-    for cmd in (f"device {args.device}", "set AutoSelectMemRanges auto", "hwtool ICD3",
-                f"LoadScript {helper}"):
+    for cmd in (f"device {args.device}", "set AutoSelectMemRanges auto"):
         mdb.command(cmd, timeout=120)
+    try:
+        hwtool = connect_tool(mdb, args.tool, helper)
+    except MdbError as e:
+        mdb.quit()
+        sys.exit(str(e))
+    print(f"debug tool: hwtool {hwtool}", flush=True)
     elf = os.path.abspath(args.elf)
     out = mdb.command(f"program {elf}", timeout=600)
     if not any("Program succeeded" in line for line in out):
@@ -639,7 +690,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", args.port))
     srv.listen(1)
-    target = Target(mdb, log, elf)
+    target = Target(mdb, log, elf, hwtool)
     # held while a GDB is connected, so the ELF watcher never programs then
     busy = threading.Lock()
     if args.watch_elf:
