@@ -14,7 +14,8 @@ Supported:
     vCont;s), interrupt (Ctrl-C), detach/kill (the server stays up)
   - breakpoints Z0/Z1 (both as hardware breakpoints, MDB "break *addr"),
     watchpoints Z2/Z3/Z4 (MDB "watch"), with the watchpoint that fired
-    found from CP0 Debug and the load/store before DEPC
+    found from CP0 Debug and the load/store at DEPC (MIPS32, MIPS16e or
+    microMIPS)
   - memory read (m) of RAM, program flash, boot flash and SFRs, memory
     write (M, X) of RAM and SFRs; a memory map tells GDB where flash is;
     the memory ranges and the number of hardware breakpoints come from MDB
@@ -81,7 +82,10 @@ class Device:
     later breakpoint of the session, even with none set.
     """
 
-    def __init__(self, mdb):
+    def __init__(self, mdb, name):
+        # the compressed ISA of the core: the M4K of the PIC32MX has
+        # MIPS16e, the newer cores (PIC32MZ, PIC32MK, PIC32MM) microMIPS
+        self.compressed_isa = "mips16e" if name.upper().startswith("PIC32MX") else "micromips"
         out = mdb.script("caps()")
         line = next((l for l in out if l.startswith("caps ")), None)
         if line is None:
@@ -128,25 +132,171 @@ class Device:
                 "<memory-map>\n" + "\n".join(lines) + "\n</memory-map>\n")
 
 
-def decode_access(insn):
-    """Decode a MIPS32 load/store: (is_store, base register, offset, size).
+def sext(value, bits):
+    sign = 1 << (bits - 1)
+    return (value & (sign - 1)) - (value & sign)
 
-    Returns None for other instructions.
-    """
+
+GP, SP = 28, 29
+# 3-bit register field of MIPS16e and of 16-bit microMIPS instructions
+REGS3 = (16, 17, 2, 3, 4, 5, 6, 7)
+# 3-bit source register field of microMIPS SB16, SH16, SW16
+REGS3_STORE = (0, 17, 2, 3, 4, 5, 6, 7)
+
+
+def access(regs, is_store, base, offset, size, rt=None):
+    """(is_store, data address, size) of a load/store, base None for an
+    absolute address in offset."""
+    if not is_store and rt is not None and rt == base:
+        return None  # the load has overwritten its base register
+    if base is not None:
+        offset += regs[base]
+    return is_store, offset & 0xFFFFFFFF, size
+
+
+def decode_mips32(code, addr, regs):
+    insn = int.from_bytes(code[:4], "little")
     op = insn >> 26
     sizes = {0x20: 1, 0x24: 1, 0x21: 2, 0x25: 2, 0x23: 4, 0x22: 4, 0x26: 4, 0x30: 4,
-             0x28: 1, 0x29: 2, 0x2B: 4, 0x2A: 4, 0x2E: 4, 0x38: 4}
+             0x28: 1, 0x29: 2, 0x2B: 4, 0x2A: 4, 0x2E: 4, 0x38: 4,
+             0x31: 4, 0x35: 8, 0x39: 4, 0x3D: 8}  # LWC1, LDC1, SWC1, SDC1
+    if op == 0x1F and insn & 0x3F == 0x0A:  # DSP LBUX, LHX, LWX rd, index(base)
+        size = {6: 1, 4: 2, 0: 4}.get((insn >> 6) & 0x1F)
+        if size:
+            return access(regs, False, None, regs[(insn >> 21) & 0x1F] + regs[(insn >> 16) & 0x1F], size)
     if op not in sizes:
         return None
-    base = (insn >> 21) & 0x1F
-    offset = insn & 0xFFFF
-    if offset & 0x8000:
-        offset -= 0x10000
-    is_store = op in (0x28, 0x29, 0x2B, 0x2A, 0x2E, 0x38)
-    rt = (insn >> 16) & 0x1F
-    if not is_store and rt == base:
-        return None  # the load has overwritten its base register
-    return is_store, base, offset, sizes[op]
+    is_store = op in (0x28, 0x29, 0x2B, 0x2A, 0x2E, 0x38, 0x39, 0x3D)
+    rt = (insn >> 16) & 0x1F if op < 0x31 else None  # not an FPU register
+    return access(regs, is_store, (insn >> 21) & 0x1F, sext(insn, 16), sizes[op], rt)
+
+
+# major opcode -> (is_store, size)
+MIPS16_ACCESS = {0x10: (False, 1), 0x11: (False, 2), 0x13: (False, 4), 0x14: (False, 1),
+                 0x15: (False, 2), 0x18: (True, 1), 0x19: (True, 2), 0x1B: (True, 4)}
+
+
+def decode_mips16(code, addr, regs):
+    hw = int.from_bytes(code[:2], "little")
+    ext = None
+    if hw >> 11 == 0x1E:  # EXTEND: the next instruction has a 16-bit immediate
+        ext = hw & 0x7FF
+        hw = int.from_bytes(code[2:4], "little")
+    op = hw >> 11
+    rx, ry = REGS3[(hw >> 8) & 7], REGS3[(hw >> 5) & 7]
+
+    def imm(field, scale):
+        if ext is None:
+            return field * scale
+        return sext((ext & 0x1F) << 11 | (ext >> 5) << 5 | hw & 0x1F, 16)
+
+    if op in MIPS16_ACCESS:
+        is_store, size = MIPS16_ACCESS[op]
+        return access(regs, is_store, rx, imm(hw & 0x1F, size), size, ry)
+    if op in (0x12, 0x1A):  # LWSP, SWSP
+        return access(regs, op == 0x1A, SP, imm(hw & 0xFF, 4), 4, rx)
+    if op == 0x16:  # LWPC, from the instruction (or its EXTEND) address
+        return access(regs, False, None, (addr & ~3) + imm(hw & 0xFF, 4), 4)
+    if op == 0x0C and (hw >> 8) & 7 == 2:  # SWRASP
+        return access(regs, True, SP, imm(hw & 0xFF, 4), 4)
+    if op == 0x0C and (hw >> 8) & 7 == 4:  # SAVE, RESTORE
+        nregs = bool(hw & 0x40) + bool(hw & 0x20) + bool(hw & 0x10)  # ra, s0, s1
+        nargs = 0
+        if ext is None:
+            frame = (hw & 0xF or 16) * 8
+        else:
+            frame = (ext & 0xF0 | hw & 0xF) * 8
+            aregs = ext & 0xF
+            if aregs == 0xF:
+                return None
+            nargs, nstatics = {0xB: (0, 4), 0xE: (4, 0)}.get(aregs, (aregs >> 2, aregs & 3))
+            nregs += (ext >> 8) + nstatics  # s2..s8
+        if hw & 0x80:  # SAVE: registers below sp, arguments from sp up
+            return access(regs, True, SP, -4 * nregs, 4 * (nregs + nargs))
+        if nregs:  # RESTORE: registers below sp + frame
+            return access(regs, False, SP, frame - 4 * nregs, 4 * nregs)
+    return None
+
+
+def micromips_size(code):
+    """Length of the microMIPS instruction: major opcode bits 2..0 of 1, 2
+    or 3 make a 16-bit instruction."""
+    return 2 if (code[1] >> 2) & 7 in (1, 2, 3) else 4
+
+
+# major opcode -> (is_store, size)
+MICROMIPS16_ACCESS = {0x02: (False, 1), 0x0A: (False, 2), 0x1A: (False, 4),
+                      0x22: (True, 1), 0x2A: (True, 2), 0x3A: (True, 4)}
+MICROMIPS32_ACCESS = {0x07: (False, 1), 0x05: (False, 1), 0x0F: (False, 2), 0x0D: (False, 2),
+                      0x3F: (False, 4), 0x06: (True, 1), 0x0E: (True, 2), 0x3E: (True, 4)}
+MICROMIPS_FPU_ACCESS = {0x27: (False, 4), 0x2F: (False, 8), 0x26: (True, 4), 0x2E: (True, 8)}
+# POOL32B and POOL32C function -> (is_store, size); 0 for LWM32/SWM32
+MICROMIPS_POOL32B = {0x1: (False, 8), 0x9: (True, 8), 0x5: (False, 0), 0xD: (True, 0)}
+MICROMIPS_POOL32C = {0x0: (False, 4), 0x1: (False, 4), 0x8: (True, 4), 0x9: (True, 4),
+                     0x3: (False, 4), 0xB: (True, 4)}  # LWL, LWR, SWL, SWR, LL, SC
+
+
+def decode_micromips(code, addr, regs):
+    hw = int.from_bytes(code[:2], "little")
+    op = hw >> 10
+    if op in MICROMIPS16_ACCESS:
+        is_store, size = MICROMIPS16_ACCESS[op]
+        field = hw & 0xF
+        offset = -1 if op == 0x02 and field == 0xF else field * size
+        rt = (REGS3_STORE if is_store else REGS3)[(hw >> 7) & 7]
+        return access(regs, is_store, REGS3[(hw >> 4) & 7], offset, size, rt)
+    if op in (0x12, 0x32):  # LWSP, SWSP
+        return access(regs, op == 0x32, SP, (hw & 0x1F) * 4, 4, (hw >> 5) & 0x1F)
+    if op == 0x19:  # LWGP
+        return access(regs, False, GP, sext(hw, 7) * 4, 4, REGS3[(hw >> 7) & 7])
+    if op == 0x11 and (hw >> 6) & 0xF in (4, 5):  # LWM16, SWM16: s0..sN, ra
+        return access(regs, (hw >> 6) & 0xF == 5, SP, (hw & 0xF) * 4, 4 * (((hw >> 4) & 3) + 2))
+    if micromips_size(code) == 2:
+        return None
+    insn = hw << 16 | int.from_bytes(code[2:4], "little")
+    rt, base = (insn >> 21) & 0x1F, (insn >> 16) & 0x1F
+    if op in MICROMIPS32_ACCESS:
+        is_store, size = MICROMIPS32_ACCESS[op]
+        return access(regs, is_store, base, sext(insn, 16), size, rt)
+    if op in MICROMIPS_FPU_ACCESS:
+        is_store, size = MICROMIPS_FPU_ACCESS[op]
+        return access(regs, is_store, base, sext(insn, 16), size)
+    pool = {0x08: MICROMIPS_POOL32B, 0x18: MICROMIPS_POOL32C}.get(op, {})
+    if (insn >> 12) & 0xF in pool:
+        is_store, size = pool[(insn >> 12) & 0xF]
+        if not size:  # LWM32, SWM32: s0..s7, s8 by count, ra by bit 4
+            size = 4 * ((rt & 0xF) + (rt >> 4))
+            rt = None
+        elif size == 8:  # LWP, SWP: rt and rt + 1
+            rt = None
+        return access(regs, is_store, base, sext(insn, 12), size, rt)
+    # LWXS and DSP LBUX, LHX, LWX rd, index(base): (size, index scale)
+    indexed = {0x118: (4, 4), 0x225: (1, 1), 0x165: (2, 1), 0x1A5: (4, 1)}.get(insn & 0x3FF)
+    if op == 0x00 and indexed:
+        size, scale = indexed
+        return access(regs, False, None, regs[base] + scale * regs[rt], size)
+    return None
+
+
+DECODERS = {"mips32": decode_mips32, "mips16e": decode_mips16, "micromips": decode_micromips}
+
+
+def decode_access(isa, code, addr, regs):
+    """Decode the load/store at addr: (is_store, data address, size).
+
+    code holds the 4 bytes at addr; regs are the GDB registers. Returns
+    None for other instructions.
+    """
+    return DECODERS[isa](code, addr, regs)
+
+
+def branch_size(isa, code):
+    """Length of the branch or jump in code, whose delay slot follows it."""
+    if isa == "mips16e":
+        return 4 if int.from_bytes(code[:2], "little") >> 11 == 0x03 else 2  # JAL, JALX
+    if isa == "micromips":
+        return micromips_size(code)
+    return 4
 
 
 class Target:
@@ -223,6 +373,9 @@ class Target:
             raise MdbError(f"write: {out}")
 
     def set_breakpoint(self, addr):
+        # GDB sets bit 0 (ISA mode) for MIPS16e and microMIPS code, but not
+        # always when it removes the breakpoint; MDB refuses such an address
+        addr &= ~1
         if addr in self.breakpoints:
             return
         if len(self.breakpoints) >= self.device.max_breakpoints:
@@ -234,7 +387,7 @@ class Target:
         self.breakpoints[addr] = int(m.group(1))
 
     def remove_breakpoint(self, addr):
-        num = self.breakpoints.pop(addr, None)
+        num = self.breakpoints.pop(addr & ~1, None)
         if num is not None:
             self.mdb.command(f"delete {num}")
 
@@ -287,24 +440,26 @@ class Target:
             candidates = [(k, a, n) for (k, a), (_, n) in self.watchpoints.items()]
         chosen = candidates[0]
         depc = regs[PC_REGNUM]
-        insn_addr = depc + 4 if debug & DEBUG_DBD else depc
+        # bit 0 of DEPC is the ISA mode: MIPS16e or microMIPS code
+        isa = self.device.compressed_isa if depc & 1 else "mips32"
+        insn_addr = depc & ~1
         how = "first"
-        if not depc & 1:  # MIPS32; MIPS16e and microMIPS set bit 0 (ISA mode)
-            try:
-                insn = self.read_words(insn_addr, 1)[0]
-                access = decode_access(insn)
-                if access and access[0] == is_store:
-                    _, base, offset, size = access
-                    daddr = (regs[base] + offset) & 0xFFFFFFFF
-                    for k, a, n in candidates:
-                        if daddr < a + max(n, 1) and a < daddr + size:
-                            chosen = (k, a, n)
-                            how = f"decoded 0x{daddr:08x}"
-                            break
-            except MdbError as e:
-                self.log.write(f"!! {e}\n")
+        try:
+            if debug & DEBUG_DBD:
+                insn_addr += branch_size(isa, self.read_memory(insn_addr, 4))
+            access = decode_access(isa, self.read_memory(insn_addr, 4), insn_addr, regs)
+            if access and access[0] == is_store:
+                _, daddr, size = access
+                for k, a, n in candidates:
+                    if daddr < a + max(n, 1) and a < daddr + size:
+                        chosen = (k, a, n)
+                        how = f"decoded 0x{daddr:08x}"
+                        break
+        except MdbError as e:
+            self.log.write(f"!! {e}\n")
         kind, addr, _ = chosen
-        self.log.write(f"## watchpoint {self.WATCH_NAMES[kind]} 0x{addr:08x} ({how}), Debug=0x{debug:08x}\n")
+        self.log.write(f"## watchpoint {self.WATCH_NAMES[kind]} 0x{addr:08x} ({how}), "
+                       f"Debug=0x{debug:08x}, DEPC=0x{depc:08x}\n")
         return f"{self.WATCH_NAMES[kind]}:{addr:x};"
 
     def program(self, elf=None):
@@ -337,6 +492,18 @@ class Target:
             self.regs = None
             return out + ["GDB still has the old registers: maintenance flush register-cache"]
         return self.mdb.command(text, timeout=600)
+
+    def stop_pc(self):
+        """PC of the stop as DEPC has it, with bit 0 set in MIPS16e and
+        microMIPS code; MDB "Stop at" gives it without, and GDB then does
+        not recognize its breakpoint there."""
+        if not self.started:
+            return self.pc
+        try:
+            return self.read_registers()[PC_REGNUM]
+        except MdbError as e:
+            self.log.write(f"!! {e}\n")
+            return self.pc
 
     def resume(self, step):
         self.regs = None
@@ -423,7 +590,7 @@ class GdbConnection:
 
     def stop_reply(self, signal=SIGTRAP):
         reason = self.target.stop_reason() if signal == SIGTRAP else ""
-        return f"T{signal:02x}{PC_REGNUM:02x}:{le32(self.target.pc)};{reason}"
+        return f"T{signal:02x}{PC_REGNUM:02x}:{le32(self.target.stop_pc())};{reason}"
 
     def registers(self):
         if not self.target.started:
@@ -708,7 +875,7 @@ def main():
         mdb.quit()
         sys.exit(str(e))
     try:
-        device = Device(mdb)
+        device = Device(mdb, args.device)
     except MdbError as e:
         mdb.quit()
         sys.exit(str(e))

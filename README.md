@@ -124,12 +124,11 @@ programming waits until programming is done, so set
   the device (the server prints them at the start; ICD 3 with PIC32MZ EC: 8
   and 4). gdb's `next` and `finish` need one breakpoint each, so keep one
   free.
-- Code is tested only as MIPS32. In MIPS16e (PIC32MX) and microMIPS
-  (PIC32MZ, PIC32MK, PIC32MM) code the server cannot decode the load or
-  store that hit a watchpoint, so with several watchpoints it may report
-  the wrong one, and gdb then continues silently. Breakpoints and stepping
-  in such code are not tested. The PIC32MM (microMIPS only) is not
-  tested at all.
+- MIPS32 and microMIPS code are tested on a PIC32MZ, MIPS16e code on a
+  PIC32MX (ICD 3: 6 breakpoints, 2 watchpoints). The PIC32MM (microMIPS
+  only) is not tested at all.
+- A load or store in the delay slot of a jump is missed by its watchpoint
+  when the target resumes from that jump (e.g. after a breakpoint on it).
 - External memory (EBI, SQI, DDR) is not in the memory map.
 - Registers cannot be written: `set $reg`, `call`, `return` and `jump` do
   not work.

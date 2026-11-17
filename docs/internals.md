@@ -24,7 +24,7 @@ runs inside the MDB JVM and can import every MDB class.
 | `qXfer:memory-map:read` | map from MDB: RAM, program flash, boot flash, SFRs (see below) |
 | `vFlashErase`, `vFlashWrite` | accepted, data ignored |
 | `vFlashDone` | `hwtool <tool>` + `program <elf>` |
-| `Z0`, `Z1` / `z0`, `z1` | `break *addr` / `delete n`, both as hardware breakpoints |
+| `Z0`, `Z1` / `z0`, `z1` | `break *addr` / `delete n`, both as hardware breakpoints; bit 0 of the address is cleared (see below) |
 | `Z2`, `Z3`, `Z4` | `watch addr W`, `R`, `RW` |
 | `c`, `vCont;c` | `run` the first time, then `continue` |
 | `s`, `vCont;s` | `stepi` (one machine instruction, about 0.06 s) |
@@ -65,20 +65,51 @@ finds it like this:
    after `stepi` (bit 0 DSS).
 2. The data breakpoint is precise: `DEPC` is the load/store itself, not
    executed yet (or the branch before it when bit 31 DBD is set, then the
-   access is at `DEPC + 4`). gdb steps over it itself, MIPS has
+   access follows the branch). gdb steps over it itself, MIPS has
    non-steppable watchpoints.
-3. The server reads that instruction, decodes the MIPS32 load/store and
-   computes base register + offset; the watchpoint whose range contains
-   this address is reported (`watch:`, `rwatch:` or `awatch:` in the stop
+3. Bit 0 of `DEPC` is the ISA mode: clear for MIPS32, set for MIPS16e
+   (PIC32MX) or microMIPS (PIC32MZ, PIC32MK, PIC32MM); which of the two
+   follows from the device name. After a branch the access is at
+   `DEPC + 4` in MIPS32, `+ 2` or `+ 4` in MIPS16e (`JAL`/`JALX` are 32
+   bits) and microMIPS (the length is in the major opcode).
+4. The server reads that instruction and decodes the load/store: base
+   register + offset, also the forms with a PC-relative (MIPS16e `LWPC`),
+   indexed (`LWXS`, DSP `LBUX`/`LHX`/`LWX`) or multi-word (`SAVE`/`RESTORE`,
+   `LWM`/`SWM`, `LWP`/`SWP`) access. The watchpoint whose range overlaps
+   the access is reported (`watch:`, `rwatch:` or `awatch:` in the stop
    reply). The RSP log has a `## watchpoint` line for each such stop.
 
 When decoding is not possible the first watchpoint of the right kind is
-reported. That happens for code in MIPS16e (PIC32MX) or microMIPS
-(PIC32MZ, PIC32MK, PIC32MM), where bit 0 of `DEPC` is set and the server
-does not decode the instruction, and for a load that overwrites its own
-base register.
+reported: for an instruction the decoder does not know (e.g. EVA or
+coprocessor 2 loads) and for a load that overwrites its own base register.
 Reporting a wrong one is not harmless: gdb then sees no change, continues
 silently, and the session looks hung.
+
+The decoders are checked against the disassembly of `xc32-objdump` for
+all three ISAs, and on the target: MIPS32 and microMIPS on a PIC32MZ,
+MIPS16e on a PIC32MX, including accesses in delay slots after 16-bit and
+32-bit jumps.
+
+### MIPS16e and microMIPS addresses
+
+gdb sets bit 0 of a code address in MIPS16e and microMIPS code. In `Z1`
+it does, in the matching `z1` not always (`Z1,9d0007f7` is removed with
+`z1,9d0007f6`). MDB refuses an odd address (`Breakpoint -1 at ...`, and
+then every later breakpoint, see below). The server clears bit 0 for
+`break` and as the key of its breakpoint table.
+
+The stop reply carries the PC from `DEPC` (with bit 0), not the address
+of MDB's `Stop at` (without it); with the even PC gdb does not recognize
+its own breakpoint and reports a plain `SIGTRAP`.
+
+### Access in the delay slot of the stop PC
+
+When the target is halted at a jump and resumes, a data breakpoint on the
+access in its delay slot does not fire (seen with `jr` + `sw` in microMIPS
+on a PIC32MZ and in MIPS16e on a PIC32MX;
+MDB `continue` probably executes the jump and its delay slot as one
+step). gdb halts there when it steps over a watchpoint hit just before the
+jump, or at a breakpoint on the jump. That access is then missed.
 
 ## MDB behavior the server depends on
 
