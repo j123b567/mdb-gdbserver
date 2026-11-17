@@ -5,9 +5,8 @@ Usage: mdb_gdbserver.py [--port 3333] [--device PIC32MZ2048ECM100]
                         [--tool TYPE[:SERIAL]] [--mdb MDB_SH] ELF
 
 Starts mdb.sh as a child process, connects the debug tool (by default the
-only one connected) in debug mode,
-programs ELF and then serves GDB connections on localhost:PORT, one after
-the other. MDB keeps running between connections, so only the first
+only one connected) in debug mode, programs ELF and then serves GDB
+connections on localhost:PORT, one after the other. MDB keeps running between connections, so only the first
 connection pays its start (about 30 s).
 
 Supported:
@@ -17,7 +16,8 @@ Supported:
     watchpoints Z2/Z3/Z4 (MDB "watch"), with the watchpoint that fired
     found from CP0 Debug and the load/store before DEPC
   - memory read (m) of RAM, program flash, boot flash and SFRs, memory
-    write (M, X) of RAM and SFRs; a memory map tells GDB where flash is
+    write (M, X) of RAM and SFRs; a memory map tells GDB where flash is;
+    the memory ranges and the number of hardware breakpoints come from MDB
   - GDB "load": vFlashErase/vFlashWrite are accepted, vFlashDone programs
     ELF (the file given on the command line, read again from disk) with
     "hwtool" + "program"; the data sent by GDB is not used
@@ -48,14 +48,6 @@ PC_REGNUM = 37
 SIGTRAP = 5
 SIGINT = 2
 
-# hardware resources of the PIC32MZ EC with the ICD 3 (ICD3DbgToolManager.emu
-# in emu.jar of MPLAB X, engine ejtagonlyiflowtrace2: maxprogbps="8"
-# maxdatabps="4"). MDB must never be asked for more: after one refused
-# "break" ("Breakpoint -1 at ...") it refuses every later breakpoint of the
-# session, even with none set.
-MAX_BREAKPOINTS = 8
-MAX_WATCHPOINTS = 4
-
 # CP0 Debug bits (MIPS EJTAG)
 DEBUG_DSS = 1 << 0   # single step
 DEBUG_DBP = 1 << 1   # SDBBP instruction
@@ -64,39 +56,76 @@ DEBUG_DDBS = 1 << 3  # data breakpoint, store
 DEBUG_DIB = 1 << 4   # instruction breakpoint
 DEBUG_DBD = 1 << 31  # the halt is in a branch delay slot, DEPC is the branch
 
-# memory map of the PIC32MZ2048EC for GDB: flash makes GDB use hardware
-# breakpoints there and "load" use vFlashErase/vFlashWrite/vFlashDone.
-# GDB keeps MIPS addresses sign-extended to 64 bits (0x9d000000 is
-# 0xffffffff9d000000), the map must use the same form or GDB refuses every
-# access as outside the map.
-MEMORY_MAP = """<?xml version="1.0"?>
-<!DOCTYPE memory-map PUBLIC "+//IDN gnu.org//DTD GDB Memory Map V1.0//EN" "http://sourceware.org/gdb/gdb-memory-map.dtd">
-<memory-map>
-  <memory type="ram" start="0xffffffff80000000" length="0x80000"/>
-  <memory type="ram" start="0xffffffffa0000000" length="0x80000"/>
-  <memory type="flash" start="0xffffffff9d000000" length="0x200000"><property name="blocksize">0x4000</property></memory>
-  <memory type="flash" start="0xffffffffbd000000" length="0x200000"><property name="blocksize">0x4000</property></memory>
-  <memory type="flash" start="0xffffffff9fc00000" length="0x74000"><property name="blocksize">0x4000</property></memory>
-  <memory type="flash" start="0xffffffffbfc00000" length="0x74000"><property name="blocksize">0x4000</property></memory>
-  <memory type="ram" start="0xffffffffbf800000" length="0x100000"/>
-</memory-map>
-"""
+# MDB memory type letter of each kind of memory range of the device
+MEM_LETTERS = {"code": "p", "boot": "p", "ram": "r", "sfr": "m"}
+KSEG0 = 0x80000000
+KSEG1 = 0xA0000000
+# GDB only needs some erase block size for flash; the server ignores the
+# data of vFlashErase/vFlashWrite. The boot flash range of the EDC may end
+# before the configuration words (PIC32MX: 0x1fc02ff0), the rounding up to
+# this size includes them.
+FLASH_BLOCK = 0x1000
 
 
 def le32(value):
     return value.to_bytes(4, "little").hex()
 
 
-def memtype(addr):
-    """MDB memory type letter for a virtual address, None if not handled."""
-    phys = addr & 0x1FFFFFFF
-    if phys < 0x00080000:
-        return "r"
-    if 0x1D000000 <= phys < 0x1D200000 or 0x1FC00000 <= phys < 0x1FC80000:
-        return "p"
-    if 0x1F800000 <= phys < 0x1F900000:
-        return "m"
-    return None
+class Device:
+    """Memory ranges and hardware breakpoints of the device on this tool.
+
+    MDB knows both: the ranges from the EDC file of the device pack
+    (Assembly.GetDevice()), the breakpoints from the .emu file of the tool
+    (ControlPointMediator). MDB must never be asked for more breakpoints:
+    after one refused "break" ("Breakpoint -1 at ...") it refuses every
+    later breakpoint of the session, even with none set.
+    """
+
+    def __init__(self, mdb):
+        out = mdb.script("caps()")
+        line = next((l for l in out if l.startswith("caps ")), None)
+        if line is None:
+            raise MdbError(f"caps(): {out}")
+        self.max_breakpoints, self.max_watchpoints = (int(v) for v in line.split()[1:])
+        self.ranges = []  # (kind, physical begin, physical end)
+        for line in mdb.script("memmap()"):
+            if line.startswith("memmap "):
+                _, kind, begin, end = line.split()
+                begin, end = int(begin, 16), int(end, 16)
+                if kind in ("code", "boot"):
+                    end = (end + FLASH_BLOCK - 1) & ~(FLASH_BLOCK - 1)
+                self.ranges.append((kind, begin, end))
+        if not self.ranges:
+            raise MdbError("memmap(): no memory ranges")
+
+    def memtype(self, addr):
+        """MDB memory type letter for a virtual address, None if not handled."""
+        phys = addr & 0x1FFFFFFF
+        for kind, begin, end in self.ranges:
+            if begin <= phys < end:
+                return MEM_LETTERS[kind]
+        return None
+
+    def memory_map(self):
+        """Memory map for GDB: flash makes GDB use hardware breakpoints there
+        and "load" use vFlashErase/vFlashWrite/vFlashDone. GDB keeps MIPS
+        addresses sign-extended to 64 bits (0x9d000000 is 0xffffffff9d000000),
+        the map must use the same form or GDB refuses every access as outside
+        the map. SFRs are only reached through KSEG1 (uncached).
+        """
+        lines = []
+        for kind, begin, end in self.ranges:
+            for seg in ((KSEG1,) if kind == "sfr" else (KSEG0, KSEG1)):
+                start = 0xFFFFFFFF00000000 | seg | begin
+                if kind in ("code", "boot"):
+                    lines.append(f'  <memory type="flash" start="0x{start:x}" length="0x{end - begin:x}">'
+                                 f'<property name="blocksize">0x{FLASH_BLOCK:x}</property></memory>')
+                else:
+                    lines.append(f'  <memory type="ram" start="0x{start:x}" length="0x{end - begin:x}"/>')
+        return ('<?xml version="1.0"?>\n'
+                '<!DOCTYPE memory-map PUBLIC "+//IDN gnu.org//DTD GDB Memory Map V1.0//EN" '
+                '"http://sourceware.org/gdb/gdb-memory-map.dtd">\n'
+                "<memory-map>\n" + "\n".join(lines) + "\n</memory-map>\n")
 
 
 def decode_access(insn):
@@ -126,8 +155,9 @@ class Target:
     WATCH_TYPES = {2: "W", 3: "R", 4: "RW"}  # GDB Z2/Z3/Z4 -> MDB "watch"
     WATCH_NAMES = {2: "watch", 3: "rwatch", 4: "awatch"}
 
-    def __init__(self, mdb, log, elf, hwtool):
+    def __init__(self, mdb, log, elf, hwtool, device):
         self.mdb = mdb
+        self.device = device
         self.log = log
         self.elf = elf
         self.hwtool = hwtool  # argument of MDB "hwtool", e.g. "icd3 0"
@@ -157,7 +187,7 @@ class Target:
         return self.regs
 
     def read_words(self, addr, count):
-        t = memtype(addr)
+        t = self.device.memtype(addr)
         if t is None:
             raise MdbError(f"no memory at 0x{addr:08x}")
         words = []
@@ -180,7 +210,7 @@ class Target:
         return data[addr - start:addr - start + length]
 
     def write_memory(self, addr, data):
-        t = memtype(addr)
+        t = self.device.memtype(addr)
         if t not in ("r", "m"):
             raise MdbError(f"write to 0x{addr:08x} not allowed")
         start = addr & ~3
@@ -195,8 +225,8 @@ class Target:
     def set_breakpoint(self, addr):
         if addr in self.breakpoints:
             return
-        if len(self.breakpoints) >= MAX_BREAKPOINTS:
-            raise MdbError(f"all {MAX_BREAKPOINTS} hardware breakpoints in use")
+        if len(self.breakpoints) >= self.device.max_breakpoints:
+            raise MdbError(f"all {self.device.max_breakpoints} hardware breakpoints in use")
         out = self.mdb.command(f"break *0x{addr:08x}")
         m = re.search(r"Breakpoint (\d+) at", "\n".join(out))  # "-1" does not match
         if not m:
@@ -211,8 +241,8 @@ class Target:
     def set_watchpoint(self, kind, addr, length):
         if (kind, addr) in self.watchpoints:
             return
-        if len(self.watchpoints) >= MAX_WATCHPOINTS:
-            raise MdbError(f"all {MAX_WATCHPOINTS} data breakpoints in use")
+        if len(self.watchpoints) >= self.device.max_watchpoints:
+            raise MdbError(f"all {self.device.max_watchpoints} data breakpoints in use")
         out = self.mdb.command(f"watch 0x{addr:08x} {self.WATCH_TYPES[kind]}")
         m = re.search(r"Watchpoint (\d+)", "\n".join(out))
         if not m:
@@ -259,7 +289,7 @@ class Target:
         depc = regs[PC_REGNUM]
         insn_addr = depc + 4 if debug & DEBUG_DBD else depc
         how = "first"
-        if not depc & 1:  # MIPS32, not microMIPS
+        if not depc & 1:  # MIPS32; MIPS16e and microMIPS set bit 0 (ISA mode)
             try:
                 insn = self.read_words(insn_addr, 1)[0]
                 access = decode_access(insn)
@@ -455,7 +485,7 @@ class GdbConnection:
                 return None
             if cmd.startswith("qXfer:memory-map:read::"):
                 offset, length = (int(v, 16) for v in cmd.split("::")[1].split(","))
-                return self.qxfer(MEMORY_MAP, offset, length)
+                return self.qxfer(self.target.device.memory_map(), offset, length)
             if cmd == "?":
                 return self.stop_reply()
             if cmd in ("qAttached",):
@@ -473,8 +503,7 @@ class GdbConnection:
             if cmd.startswith("p"):
                 n = int(cmd[1:], 16)
                 if n >= NUM_REGS:
-                    # FPU and other registers GDB knows for MIPS, the PIC32MZ EC
-                    # has no FPU
+                    # FPU and other registers GDB knows for MIPS; not read
                     return "xxxxxxxx"
                 if not self.target.started:
                     return le32(self.target.pc) if n == PC_REGNUM else "xxxxxxxx"
@@ -678,7 +707,13 @@ def main():
     except MdbError as e:
         mdb.quit()
         sys.exit(str(e))
-    print(f"debug tool: hwtool {hwtool}", flush=True)
+    try:
+        device = Device(mdb)
+    except MdbError as e:
+        mdb.quit()
+        sys.exit(str(e))
+    print(f"debug tool: hwtool {hwtool}, {device.max_breakpoints} breakpoints, "
+          f"{device.max_watchpoints} watchpoints", flush=True)
     elf = os.path.abspath(args.elf)
     out = mdb.command(f"program {elf}", timeout=600)
     if not any("Program succeeded" in line for line in out):
@@ -690,7 +725,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", args.port))
     srv.listen(1)
-    target = Target(mdb, log, elf, hwtool)
+    target = Target(mdb, log, elf, hwtool, device)
     # held while a GDB is connected, so the ELF watcher never programs then
     busy = threading.Lock()
     if args.watch_elf:

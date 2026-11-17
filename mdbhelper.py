@@ -102,6 +102,34 @@ def tool():
     _out("end")
 
 
+def caps():
+    """Print the number of instruction and data breakpoints of the tool on
+    this device: "caps INSTRUCTION DATA"."""
+    try:
+        from com.microchip.mplab.mdbcore.ControlPointMediator import ControlPointMediator
+        c = _assembly().getLookup().lookup(ControlPointMediator).getEmulationCapabilities()
+        _out("caps %d %d" % (c.getMaxInstructionBPs(), c.getMaxDataBPs()))
+    except Exception, e:
+        _out("error %s" % e)
+    _out("end")
+
+
+def memmap():
+    """Print the physical memory ranges of the device (EDC of the device
+    pack): "memmap KIND BEGIN END" for program flash, boot flash, RAM and
+    SFRs, END exclusive."""
+    try:
+        part = _assembly().GetDevice().getMainPartition()
+        for kind, getter in (("code", part.getCodeRange), ("boot", part.getBootConfigRange),
+                             ("ram", part.getGPRRange), ("sfr", part.getSFRRange)):
+            r = getter()
+            if r is not None and r.second > r.first:
+                _out("memmap %s %x %x" % (kind, r.first, r.second))
+    except Exception, e:
+        _out("error %s" % e)
+    _out("end")
+
+
 def regs():
     """Print the 38 GDB registers as hex words, in GDB order, then CP0 Debug."""
     try:

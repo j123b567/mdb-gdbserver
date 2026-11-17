@@ -14,9 +14,10 @@ is patched.
 - An MPLAB debug tool. Tested with the ICD 3; the others MDB knows
   (`icd4`, `pickit3`, `pickit4`, `snap`, `realice`, ...) are selected the
   same way, but are not tested.
-- PIC32MZ2048ECM100. The memory map and the breakpoint limits of this chip
-  are built in; other PIC32MZ EC devices may work with `--device`, but are
-  not tested.
+- A PIC32 with a MIPS32 core (PIC32MX, PIC32MZ, PIC32MK), set with
+  `--device`. The memory map and the number of hardware breakpoints come
+  from MDB. Tested on the PIC32MZ2048ECM100; the map of other devices was
+  checked in the MDB simulator only.
 - Python 3.
 - gdb with MIPS support (for example a multiarch or multitarget build).
 
@@ -45,7 +46,7 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--port` | TCP port, default 3333 (only on 127.0.0.1) |
-| `--device` | default `PIC32MZ2048ECM100` |
+| `--device` | device name as in MPLAB X, default `PIC32MZ2048ECM100` |
 | `--tool` | debug tool as `TYPE[:SERIAL]`, e.g. `icd3` or `icd3:JIT123456789`, or `:SERIAL` alone; default: the only tool connected |
 | `--mdb` | path of `mdb.sh`, default `$MDB_SH` or the MPLAB X v5.45 location |
 | `--watch-elf` | program the ELF again when the file changes and no gdb is connected |
@@ -119,16 +120,23 @@ programming waits until programming is done, so set
 
 ## Limitations
 
-- 8 hardware breakpoints and 4 watchpoints, no software breakpoints. gdb's
-  `next` and `finish` need one breakpoint each, so keep one free.
+- Only hardware breakpoints and watchpoints, as many as the tool has for
+  the device (the server prints them at the start; ICD 3 with PIC32MZ EC: 8
+  and 4). gdb's `next` and `finish` need one breakpoint each, so keep one
+  free.
+- Code is tested only as MIPS32. In MIPS16e (PIC32MX) and microMIPS
+  (PIC32MZ, PIC32MK, PIC32MM) code the server cannot decode the load or
+  store that hit a watchpoint, so with several watchpoints it may report
+  the wrong one, and gdb then continues silently. Breakpoints and stepping
+  in such code are not tested. The PIC32MM (microMIPS only) is not
+  tested at all.
+- External memory (EBI, SQI, DDR) is not in the memory map.
 - Registers cannot be written: `set $reg`, `call`, `return` and `jump` do
   not work.
 - The server cannot attach to a running target. The first `continue`
   starts the program from the reset vector; before it gdb sees only the
   reset PC 0xBFC00000.
 - A halt (breakpoint, Ctrl-C) takes about 0.8 s.
-- The device is fixed in the code (see
-  [docs/internals.md](docs/internals.md)).
 
 ## License
 

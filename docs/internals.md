@@ -21,7 +21,7 @@ runs inside the MDB JVM and can import every MDB class.
 | `g`, `p n` | `Execute regs()` (Jython): r0..r31, `Status`, `lo`, `hi`, `BadVAddr`, `Cause`, `DEPC` as pc, and CP0 `Debug`; read once per stop, 1.5 s the first time, then about 0.04 s |
 | `m` | `x /r` (RAM, KSEG0/1 0x8000_0000 / 0xA000_0000), `x /p` (program and boot flash), `x /m` (SFRs), up to 64 words per command |
 | `M`, `X` | `write /r`, `write /m` (read-modify-write of whole words); flash is refused |
-| `qXfer:memory-map:read` | fixed map: RAM, program flash, boot flash, SFRs |
+| `qXfer:memory-map:read` | map from MDB: RAM, program flash, boot flash, SFRs (see below) |
 | `vFlashErase`, `vFlashWrite` | accepted, data ignored |
 | `vFlashDone` | `hwtool <tool>` + `program <elf>` |
 | `Z0`, `Z1` / `z0`, `z1` | `break *addr` / `delete n`, both as hardware breakpoints |
@@ -72,18 +72,21 @@ finds it like this:
    this address is reported (`watch:`, `rwatch:` or `awatch:` in the stop
    reply). The RSP log has a `## watchpoint` line for each such stop.
 
-When decoding is not possible (microMIPS, a load that overwrites its own
-base register) the first watchpoint of the right kind is reported.
+When decoding is not possible the first watchpoint of the right kind is
+reported. That happens for code in MIPS16e (PIC32MX) or microMIPS
+(PIC32MZ, PIC32MK, PIC32MM), where bit 0 of `DEPC` is set and the server
+does not decode the instruction, and for a load that overwrites its own
+base register.
 Reporting a wrong one is not harmless: gdb then sees no change, continues
 silently, and the session looks hung.
 
 ## MDB behavior the server depends on
 
-- **Breakpoint limit.** The ICD 3 on the PIC32MZ EC has 8 instruction and
-  4 data breakpoints (`ICD3DbgToolManager.emu` in `emu.jar` of MPLAB X).
-  The server refuses the 9th breakpoint itself (`E01`). It must not ask
-  MDB: after one refused `break` (`Breakpoint -1 at ...`) MDB refuses every
-  later breakpoint of the session, even when none is set.
+- **Breakpoint limit.** The tool has a fixed number of instruction and
+  data breakpoints per device, e.g. 8 and 4 for the ICD 3 on the PIC32MZ
+  EC (see below). The server refuses one more itself (`E01`). It must not
+  ask MDB: after one refused `break` (`Breakpoint -1 at ...`) MDB refuses
+  every later breakpoint of the session, even when none is set.
 - **No register write.** `P`/`G` return `E01` (except the pc after `load`).
   Writes through `RegisterViewProvider.writeSFRValue`,
   `SFRegister.WriteValue` and `NMMR.GetPhysicalMemory().WriteWord` all
@@ -111,7 +114,24 @@ silently, and the session looks hung.
 
 ## Device-specific parts
 
-Fixed in the code: the memory map for `x /r|/p|/m` and for gdb (RAM,
-program flash, boot flash, SFRs, sizes of the PIC32MZ2048) and the limits
-of 8 breakpoints and 4 watchpoints. MIPS registers,
-CP0 `Debug` and the KSEG layout are the same on PIC32MX and PIC32MZ.
+Read from MDB after `hwtool`, through the helper:
+
+- `caps()`: the number of instruction and data breakpoints,
+  `ControlPointMediator.getEmulationCapabilities()`
+  (`getMaxInstructionBPs()`, `getMaxDataBPs()`). MDB takes them from the
+  `.emu` file of the tool in `emu.jar` (`ICD3DbgToolManager.emu` and
+  others): per device an emulation engine, e.g. `ejtagonlyiflowtrace2`
+  with 8 and 4 for the PIC32MZ EC, `ejtagbvci` with 6 and 2 for the
+  PIC32MX795. The simulator reports 1000 of each.
+- `memmap()`: physical ranges of program flash, boot flash, RAM and SFRs
+  from the EDC file of the device pack, `Assembly.GetDevice()
+  .getMainPartition()` (`getCodeRange()`, `getBootConfigRange()`,
+  `getGPRRange()`, `getSFRRange()`). The server maps flash and RAM into
+  KSEG0 and KSEG1 and SFRs into KSEG1, and uses the ranges both for the
+  gdb memory map and for the MDB memory type of `x` and `write` (`/p`,
+  `/r`, `/m`). Flash ranges are rounded up to 4 KB: the boot flash range
+  of the PIC32MX795 ends at 0x1fc02ff0, before its configuration words.
+  External memory (EBI, SQI, DDR) is not in the map.
+
+MIPS registers, CP0 `Debug` and the KSEG layout are the same on PIC32MX,
+PIC32MZ and PIC32MK.
